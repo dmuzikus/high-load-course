@@ -23,10 +23,8 @@ class SlidingWindowRateLimiter(
     private val mutex = ReentrantLock()
 
     override fun tick(): Boolean {
-        return if (sum.get() >= rate) {
-            false
-        } else {
-            if (sum.get() < rate) {
+        mutex.withLock {
+            return if (sum.get() < rate) {
                 queue.add(Measure(1, System.currentTimeMillis()))
                 sum.incrementAndGet()
                 true

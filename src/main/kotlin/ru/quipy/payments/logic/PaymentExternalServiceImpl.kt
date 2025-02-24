@@ -2,6 +2,7 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -12,6 +13,8 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.Executors
+import java.util.concurrent.Semaphore
 
 
 // Advice: always treat time as a Duration
@@ -36,6 +39,13 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
 
     private val client = OkHttpClient.Builder().build()
+    private val semaphore = Semaphore(parallelRequests)
+
+    /*
+    * or using dispatcher with OkHttpClient:
+    * private val dispatcher = Dispatcher(Executors.newFixedThreadPool(parallelRequests));
+    * private val client = OkHttpClient.Builder().dispatcher(dispatcher).build()
+    */
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -54,6 +64,7 @@ class PaymentExternalSystemAdapterImpl(
             post(emptyBody)
         }.build()
 
+        semaphore.acquire()
         rateLimiter.tickBlocking()
 
         try {
@@ -91,6 +102,8 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         }
+
+        semaphore.release()
     }
 
     override fun price() = properties.price

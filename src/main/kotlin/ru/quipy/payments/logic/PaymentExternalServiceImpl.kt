@@ -2,15 +2,20 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.OngoingWindow
+import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.Executors
+import java.util.concurrent.Semaphore
 
 
 // Advice: always treat time as a Duration
@@ -32,7 +37,17 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
+    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+    private val ongoingWindow = OngoingWindow(parallelRequests)
+
     private val client = OkHttpClient.Builder().build()
+    //private val semaphore = Semaphore(parallelRequests)
+
+    /*
+    * or using dispatcher with OkHttpClient:
+    * private val dispatcher = Dispatcher(Executors.newFixedThreadPool(parallelRequests));
+    * private val client = OkHttpClient.Builder().dispatcher(dispatcher).build()
+    */
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -52,6 +67,10 @@ class PaymentExternalSystemAdapterImpl(
         }.build()
 
         try {
+            //semaphore.acquire()
+            ongoingWindow.acquire()
+            rateLimiter.tickBlocking()
+
             client.newCall(request).execute().use { response ->
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
@@ -85,6 +104,9 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+        } finally {
+            //semaphore.release()
+            ongoingWindow.release()
         }
     }
 

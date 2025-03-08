@@ -2,19 +2,16 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
-import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
-import java.util.concurrent.Executors
 import java.util.concurrent.Semaphore
 
 
@@ -38,16 +35,8 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
-    private val ongoingWindow = OngoingWindow(parallelRequests)
-
+    private val semaphore = Semaphore(parallelRequests, true)
     private val client = OkHttpClient.Builder().build()
-    //private val semaphore = Semaphore(parallelRequests)
-
-    /*
-    * or using dispatcher with OkHttpClient:
-    * private val dispatcher = Dispatcher(Executors.newFixedThreadPool(parallelRequests));
-    * private val client = OkHttpClient.Builder().dispatcher(dispatcher).build()
-    */
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -66,10 +55,34 @@ class PaymentExternalSystemAdapterImpl(
             post(emptyBody)
         }.build()
 
+        if (isOverDeadline(deadline)) {
+            logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId")
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Request deadline.")
+            }
+            return
+        }
+
         try {
-            //semaphore.acquire()
-            ongoingWindow.acquire()
+            semaphore.acquire()
+
+            if (isOverDeadline(deadline)) {
+                logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId")
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Request deadline.")
+                }
+                return
+            }
+
             rateLimiter.tickBlocking()
+
+            if (isOverDeadline(deadline)) {
+                logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId")
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Request deadline.")
+                }
+                return
+            }
 
             client.newCall(request).execute().use { response ->
                 val body = try {
@@ -87,6 +100,8 @@ class PaymentExternalSystemAdapterImpl(
                     it.logProcessing(body.result, now(), transactionId, reason = body.message)
                 }
             }
+
+
         } catch (e: Exception) {
             when (e) {
                 is SocketTimeoutException -> {
@@ -105,8 +120,7 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         } finally {
-            //semaphore.release()
-            ongoingWindow.release()
+            semaphore.release()
         }
     }
 
@@ -115,6 +129,9 @@ class PaymentExternalSystemAdapterImpl(
     override fun isEnabled() = properties.enabled
 
     override fun name() = properties.accountName
+    private fun isOverDeadline(deadline: Long): Boolean {
+        return now() + requestAverageProcessingTime.toMillis() * 3 >= deadline
+    }
 
 }
 

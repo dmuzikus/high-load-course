@@ -13,7 +13,7 @@ import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.Semaphore
-
+import kotlin.math.*
 
 // Advice: always treat time as a Duration
 class PaymentExternalSystemAdapterImpl(
@@ -26,6 +26,8 @@ class PaymentExternalSystemAdapterImpl(
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
+
+        val RETRYABLE_HTTP_CODES = setOf(429, 500, 502, 503, 504)
     }
 
     private val serviceName = properties.serviceName
@@ -40,7 +42,6 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
-
         val transactionId = UUID.randomUUID()
         logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
 
@@ -84,23 +85,7 @@ class PaymentExternalSystemAdapterImpl(
                 return
             }
 
-            client.newCall(request).execute().use { response ->
-                val body = try {
-                    mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                } catch (e: Exception) {
-                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                    ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
-                }
-
-                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-                // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                paymentESService.update(paymentId) {
-                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                }
-            }
-
+            processPaymentReqSync(request, transactionId, paymentId, paymentStartedAt, deadline)
 
         } catch (e: Exception) {
             when (e) {
@@ -129,10 +114,47 @@ class PaymentExternalSystemAdapterImpl(
     override fun isEnabled() = properties.enabled
 
     override fun name() = properties.accountName
-    private fun isOverDeadline(deadline: Long): Boolean {
-        return now() + requestAverageProcessingTime.toMillis() * 3 >= deadline
+
+    private fun processPaymentReqSync(
+            request: Request,
+            transactionId: UUID,
+            paymentId: UUID,
+            paymentStartedAt: Long,
+            deadline: Long,
+            attemptNum: Int = 0
+    ) {
+        attemptNum.inc()
+
+        if (attemptNum > floor((deadline - paymentStartedAt - 1).toDouble() / (properties.averageProcessingTime.toMillis()) - 1).toLong()) {
+            return
+        }
+
+        client.newCall(request).execute().use { response ->
+            val body = try {
+                mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+            } catch (e: Exception) {
+                logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+            }
+
+            logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+
+            // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
+            // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
+            paymentESService.update(paymentId) {
+                it.logProcessing(body.result, now(), transactionId, reason = body.message)
+            }
+
+            if ((!body.result || RETRYABLE_HTTP_CODES.contains(response.code)) && !isOverDeadline(deadline)) {
+                rateLimiter.tickBlocking()
+                processPaymentReqSync(request, transactionId, paymentId, paymentStartedAt, deadline, attemptNum)
+            }
+        }
     }
 
+    private fun isOverDeadline(deadline: Long): Boolean {
+        return deadline - now() < properties.averageProcessingTime.toMillis() * 2
+    }
 }
 
 public fun now() = System.currentTimeMillis()

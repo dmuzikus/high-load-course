@@ -13,6 +13,8 @@ import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.Semaphore
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import kotlin.math.*
 
 // Advice: always treat time as a Duration
@@ -38,12 +40,16 @@ class PaymentExternalSystemAdapterImpl(
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val semaphore = Semaphore(parallelRequests, true)
-    private val client = OkHttpClient.Builder().build()
+    private val client = OkHttpClient.Builder().callTimeout(Duration.ofMillis(requestAverageProcessingTime.toMillis() + 100)).build()
+
+    private val processingTimes = LinkedList<Long>()
+    private val processingTimesMaxSize = rateLimitPerSec
+    private val mutex = ReentrantLock()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
         val transactionId = UUID.randomUUID()
-        logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
+        logger.info("[$accountName] Submit for $paymentId , txId: $transactionId, amount: $amount")
 
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
         // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
@@ -85,7 +91,7 @@ class PaymentExternalSystemAdapterImpl(
                 return
             }
 
-            processPaymentReqSync(request, transactionId, paymentId, paymentStartedAt, deadline)
+            processPaymentReqSync(request, transactionId, paymentId,amount, paymentStartedAt, deadline)
 
         } catch (e: Exception) {
             when (e) {
@@ -119,41 +125,119 @@ class PaymentExternalSystemAdapterImpl(
             request: Request,
             transactionId: UUID,
             paymentId: UUID,
+            amount: Int,
             paymentStartedAt: Long,
             deadline: Long,
             attemptNum: Int = 0
     ) {
-        attemptNum.inc()
-
-        if (attemptNum > floor((deadline - paymentStartedAt - 1).toDouble() / (properties.averageProcessingTime.toMillis()) - 1).toLong()) {
+        if (!isNextAttemptRational(attemptNum, amount)) {
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Request's next attempt isn't rational.")
+            }
             return
         }
 
-        client.newCall(request).execute().use { response ->
-            val body = try {
-                mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-            } catch (e: Exception) {
-                logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-            }
+        attemptNum.inc()
 
-            logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+        val avgPT = avgPT()
 
-            // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-            // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
+        if (isOverDeadline(deadline, avgPT)) {
+            logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId")
             paymentESService.update(paymentId) {
-                it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                it.logProcessing(false, now(), transactionId, reason = "Request deadline.")
             }
+            return
+        }
 
-            if ((!body.result || RETRYABLE_HTTP_CODES.contains(response.code)) && !isOverDeadline(deadline)) {
-                rateLimiter.tickBlocking()
-                processPaymentReqSync(request, transactionId, paymentId, paymentStartedAt, deadline, attemptNum)
+        val startTime = now()
+
+        try {
+            client.newCall(request).execute().use { response ->
+                val body = try {
+                    mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                } catch (e: Exception) {
+                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                    ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                }
+
+                addProcessingTime(now() - startTime)
+
+                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+
+                // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
+                // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
+                paymentESService.update(paymentId) {
+                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                }
+
+                if ((!body.result || RETRYABLE_HTTP_CODES.contains(response.code)) && !isOverDeadline(deadline)) {
+                    waitUntilNextAllowedAttempt(startTime)
+                    processPaymentReqSync(request, transactionId, paymentId,amount, paymentStartedAt, deadline, attemptNum)
+                }
+            }
+        } catch (e: Exception) {
+            if (!isOverDeadline(deadline, avgPT)) {
+                waitUntilNextAllowedAttempt(startTime)
+                processPaymentReqSync(request, transactionId, paymentId,amount, paymentStartedAt, deadline, attemptNum)
+            } else {
+                throw e
             }
         }
     }
 
-    private fun isOverDeadline(deadline: Long): Boolean {
-        return deadline - now() < properties.averageProcessingTime.toMillis() * 2
+    private fun waitUntilNextAllowedAttempt(startTime: Long) {
+        rateLimiter.tickBlocking()
+        val delta = now() - startTime
+        if (delta <= 1000) {
+            Thread.sleep(1000 - delta)
+        }
+    }
+
+    private fun isNextAttemptRational(attemptNum: Int, amount: Int): Boolean {
+        if (properties.price >= amount) return false
+        if (attemptNum >= floor(6000.0 / properties.averageProcessingTime.toMillis())) return false
+
+        val totalCostIfFail = (attemptNum + 1) * properties.price
+        val expectedProfit = amount - totalCostIfFail
+
+        return expectedProfit >= 0
+    }
+
+    private fun addProcessingTime(duration: Long) {
+        mutex.withLock {
+            processingTimes.add(duration)
+            while (processingTimes.size > processingTimesMaxSize) {
+                processingTimes.removeFirst()
+            }
+        }
+    }
+
+    private fun calcPT(quantile: Double): Long {
+        mutex.withLock {
+            if (processingTimes.size < processingTimesMaxSize) {
+                return properties.averageProcessingTime.toMillis()
+            }
+            val sorted = processingTimes.sorted()
+            val size = sorted.size
+            val quantileIndex = (size - 1) * quantile // индекс
+            val lowerIndex = quantileIndex.toInt() // коругленный индекс
+            val fraction = quantileIndex - lowerIndex // остаток
+
+            return if (lowerIndex >= size - 1) {
+                sorted.last()
+            } else {
+                (sorted[lowerIndex] + (sorted[lowerIndex + 1] - sorted[lowerIndex]) * fraction).toLong() // линейная интерполяция
+            }
+        }
+    }
+
+    private fun avgPT(): Duration {
+        val quantileValue = calcPT(0.5)
+        return Duration.ofMillis(quantileValue)
+    }
+
+    private fun isOverDeadline(deadline: Long, avgPT: Duration = avgPT()): Boolean {
+        return deadline - now() < avgPT.toMillis()
     }
 }
 

@@ -43,7 +43,7 @@ class PaymentExternalSystemAdapterImpl(
     private val client = OkHttpClient.Builder().callTimeout(Duration.ofMillis(requestAverageProcessingTime.toMillis() + 100)).build()
 
     private val processingTimes = LinkedList<Long>()
-    private val processingTimesMaxSize = rateLimitPerSec
+    private val processingTimesMaxSize = rateLimitPerSec*2
     private val mutex = ReentrantLock()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -58,7 +58,14 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         val request = Request.Builder().run {
-            url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+            url("http://localhost:1234/external/process?" +
+                    "serviceName=${serviceName}&" +
+                    "accountName=${accountName}&" +
+                    "transactionId=$transactionId&" +
+                    "paymentId=$paymentId&" +
+                    "amount=$amount&" +
+                    "timeout=${Duration.ofMillis(requestAverageProcessingTime.toMillis() - 50)}"
+            )
             post(emptyBody)
         }.build()
 
@@ -171,12 +178,14 @@ class PaymentExternalSystemAdapterImpl(
                 }
 
                 if ((!body.result || RETRYABLE_HTTP_CODES.contains(response.code)) && !isOverDeadline(deadline)) {
+                    Thread.sleep(max(requestAverageProcessingTime.toMillis() - 50 - (now()-startTime) + 150, 25))
                     waitUntilNextAllowedAttempt(startTime)
                     processPaymentReqSync(request, transactionId, paymentId,amount, paymentStartedAt, deadline, attemptNum)
                 }
             }
         } catch (e: Exception) {
             if (!isOverDeadline(deadline, avgPT)) {
+                Thread.sleep(max(requestAverageProcessingTime.toMillis() - 50 - (now()-startTime) + 150, 25))
                 waitUntilNextAllowedAttempt(startTime)
                 processPaymentReqSync(request, transactionId, paymentId,amount, paymentStartedAt, deadline, attemptNum)
             } else {
@@ -188,14 +197,14 @@ class PaymentExternalSystemAdapterImpl(
     private fun waitUntilNextAllowedAttempt(startTime: Long) {
         rateLimiter.tickBlocking()
         val delta = now() - startTime
-        if (delta <= 1000) {
-            Thread.sleep(1000 - delta)
-        }
+        val timeToWait = max(1000 - delta, 5)
+
+        Thread.sleep(timeToWait)
     }
 
     private fun isNextAttemptRational(attemptNum: Int, amount: Int): Boolean {
         if (properties.price >= amount) return false
-        if (attemptNum >= floor(6000.0 / properties.averageProcessingTime.toMillis())) return false
+        if (attemptNum >= floor(5000.0 / properties.averageProcessingTime.toMillis())) return false
 
         val totalCostIfFail = (attemptNum + 1) * properties.price
         val expectedProfit = amount - totalCostIfFail
@@ -232,7 +241,7 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private fun avgPT(): Duration {
-        val quantileValue = calcPT(0.5)
+        val quantileValue = calcPT(0.9)
         return Duration.ofMillis(quantileValue)
     }
 

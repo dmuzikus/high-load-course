@@ -12,15 +12,15 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
-import java.util.concurrent.Semaphore
+import java.util.concurrent.*
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import kotlin.math.*
 
 // Advice: always treat time as a Duration
 class PaymentExternalSystemAdapterImpl(
-    private val properties: PaymentAccountProperties,
-    private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
+        private val properties: PaymentAccountProperties,
+        private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -45,6 +45,16 @@ class PaymentExternalSystemAdapterImpl(
     private val processingTimes = LinkedList<Long>()
     private val processingTimesMaxSize = rateLimitPerSec*2
     private val mutex = ReentrantLock()
+
+    private val boundedQueue = LinkedBlockingQueue<Runnable>(12)
+
+    private val pool = ThreadPoolExecutor(
+            12, 32,
+            70, TimeUnit.SECONDS,
+            boundedQueue,
+            Executors.defaultThreadFactory(),
+            ThreadPoolExecutor.AbortPolicy()
+    )
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -78,8 +88,52 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         try {
-            semaphore.acquire()
+            pool.submit {
+                try {
+                    semaphore.acquire()
 
+                    if (isOverDeadline(deadline)) {
+                        logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId")
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, now(), transactionId, reason = "Request deadline.")
+                        }
+                        return@submit
+                    }
+
+                    rateLimiter.tickBlocking()
+
+                    if (isOverDeadline(deadline)) {
+                        logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId")
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, now(), transactionId, reason = "Request deadline.")
+                        }
+                        return@submit
+                    }
+
+                    processPaymentReqSync(request, transactionId, paymentId,amount, paymentStartedAt, deadline)
+
+                } catch (e: Exception) {
+                    when (e) {
+                        is SocketTimeoutException -> {
+                            logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                            }
+                        }
+
+                        else -> {
+                            logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
+
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(false, now(), transactionId, reason = e.message)
+                            }
+                        }
+                    }
+                } finally {
+                    semaphore.release()
+                }
+            }
+        } catch (e: RejectedExecutionException) {
             if (isOverDeadline(deadline)) {
                 logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId")
                 paymentESService.update(paymentId) {
@@ -87,39 +141,9 @@ class PaymentExternalSystemAdapterImpl(
                 }
                 return
             }
-
-            rateLimiter.tickBlocking()
-
-            if (isOverDeadline(deadline)) {
-                logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId")
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Request deadline.")
-                }
-                return
-            }
-
-            processPaymentReqSync(request, transactionId, paymentId,amount, paymentStartedAt, deadline)
-
-        } catch (e: Exception) {
-            when (e) {
-                is SocketTimeoutException -> {
-                    logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-                    }
-                }
-
-                else -> {
-                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = e.message)
-                    }
-                }
-            }
-        } finally {
-            semaphore.release()
+            performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
         }
+
     }
 
     override fun price() = properties.price

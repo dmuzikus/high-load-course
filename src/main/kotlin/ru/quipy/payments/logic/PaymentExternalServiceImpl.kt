@@ -40,7 +40,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val semaphore = Semaphore(parallelRequests, true)
-    private val client = OkHttpClient.Builder().callTimeout(Duration.ofMillis(requestAverageProcessingTime.toMillis() + 100)).build()
+    private val client = OkHttpClient.Builder().callTimeout(Duration.ofMillis(requestAverageProcessingTime.toMillis() + 150)).build()
 
     private val processingTimes = LinkedList<Long>()
     private val processingTimesMaxSize = rateLimitPerSec*2
@@ -64,7 +64,7 @@ class PaymentExternalSystemAdapterImpl(
                     "transactionId=$transactionId&" +
                     "paymentId=$paymentId&" +
                     "amount=$amount&" +
-                    "timeout=${Duration.ofMillis(requestAverageProcessingTime.toMillis() - 50)}"
+                    "timeout=${Duration.ofMillis(requestAverageProcessingTime.toMillis())}"
             )
             post(emptyBody)
         }.build()
@@ -178,14 +178,13 @@ class PaymentExternalSystemAdapterImpl(
                 }
 
                 if ((!body.result || RETRYABLE_HTTP_CODES.contains(response.code)) && !isOverDeadline(deadline)) {
-                    Thread.sleep(max(requestAverageProcessingTime.toMillis() - 50 - (now()-startTime) + 150, 25))
                     waitUntilNextAllowedAttempt(startTime)
                     processPaymentReqSync(request, transactionId, paymentId,amount, paymentStartedAt, deadline, attemptNum)
                 }
             }
         } catch (e: Exception) {
             if (!isOverDeadline(deadline, avgPT)) {
-                Thread.sleep(max(requestAverageProcessingTime.toMillis() - 50 - (now()-startTime) + 150, 25))
+                Thread.sleep(max(requestAverageProcessingTime.toMillis() - (now()-startTime) + 25, 25))
                 waitUntilNextAllowedAttempt(startTime)
                 processPaymentReqSync(request, transactionId, paymentId,amount, paymentStartedAt, deadline, attemptNum)
             } else {

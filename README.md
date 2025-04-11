@@ -1,22 +1,76 @@
-# Template for the HighLoad course
-This project is based on [Tiny Event Sourcing library](https://github.com/andrsuh/tiny-event-sourcing)
+# Test-Case №3
 
-### Run PostgreSql
-This example uses Postgres as an implementation of the Event store. You can see it in `pom.xml`:
+## Запуск теста
+```http request
+POST http://127.0.0.1:1234/test/run
+Content-Type: application/json
 
-```
-<dependency>
-    <groupId>ru.quipy</groupId>
-    <artifactId>tiny-postgres-event-store-spring-boot-starter</artifactId>
-    <version>${tiny.es.version}</version>
-</dependency>
-```
-
-Thus, you have to run Postgres in order to test this example. We have `docker-compose` file in the root. Run following command to start the database:
-
-```
-docker-compose up
+{
+  "ratePerSecond": 2,
+  "testCount": 500,
+  "processingTimeMillis": 60000
+}
 ```
 
-### Run the application
-To make the application run you can start the main class `OnlineShopApplication`.
+## Параметры сервиса оплаты (аккаунта)
+
+* Payment accounts list:
+    + PaymentAccountProperties
+        - serviceName=onlineStore
+        - accountName=acc-5
+        - parallelRequests=5
+        - rateLimitPerSec=3
+        - price=30
+        - averageProcessingTime=PT4.9S
+
+## Задача
+
+У нас есть `Shop`, клиенты которого хотят создать и оплатить заказ. Оплата происходит через внешний сервис оплаты,
+для которого мы должны соблюдать лимиты (у каждого аккаунта свои). Также у него реализован `back pressure`:
+при нарушении `rate limit` или `window limit` запрос будет отклонен, а деньги за обращение к нему все равно будут списаны.
+
+## Решенные задачи
+
+* `rate limit` внешнего сервиса оплаты соблюдается благодаря `SlidingWindowRateLimiter`
+* `window limit` внешнего сервиса оплаты соблюдается благодаря `Semaphore` / `OngoingWindow`
+
+## Решение
+
+Для начала потребовалось понять, какова входящая и исходящая нагрузка:
+* `Submit Rate` - 2
+* `Processing Speed` - 3
+
+Казалось бы, выглядит все здорово, так как `Submit Rate` <= `Processing Speed`, однако, если взглянуть на 
+фактический лимит <br /> 
+```
+windowSize / averageProcessingTime * parallelRequests = Real Rate
+
+1 / 4.9 * 5 = 1.02
+```
+то получается совсем другая картина:
+
+* `Submit Rate` - 2
+* `Processing Speed` - 1.02
+
+`Submit Rate` > `Processing Speed`
+
+Несмотря на то, что `rateLimitPerSec` у внешнего сервиса оплаты равен 3, фактически он сможет обработать лишь 1.02 запроса.
+
+При постоянно превышающем `Submit Rate`- е накапливается очередь запросов, и, в какой-то момент мы не выдержим и лопнем.
+Никакая буферизация и тд. нас не спасет в данном случае. (да и вообще может съесть всю память).
+
+Единственным решением в данном кейсе стала проверка `deadline` - а запроса для 'разгребания' очереди запросов (чтобы не лопнуть).
+Так как нам дается среднее время выполнения, то из предположения, что оно распределено нормально, воспользовались правилом трех сигм - 
+отбрасываем запрос, если оставшееся время до `deadline` меньше, чем `averageProcessingTime*3`. Грубо говоря, считаем, что каждый запрос будет
+выполняться максимально долго - `averageProcessingTime*3`.
+(Вероятность того, что случайная величина примет значение, отклоняющееся от математического ожидания больше чем на три среднеквадратических отклонения, не превышает 0,28%, т.е. пренебрежимо мала)
+
+## Полученные результаты
+
+### Прибыль < 93%
+Приемлемое значение с учетом фейлов (недополучили прибыль)
+![](/doc/images/metrics_1.png)
+### Успешных тестов в 1.5 раза больше фейлов/ошибок
+![](/doc/images/metrics_2.png)
+### Отсутствует превышение лимитов (*_limit_breached)
+![](/doc/images/metrics_3.png)

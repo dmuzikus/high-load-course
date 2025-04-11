@@ -40,7 +40,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val semaphore = Semaphore(parallelRequests, true)
-    private val client = OkHttpClient.Builder().callTimeout(Duration.ofMillis(requestAverageProcessingTime.toMillis() + 150)).build()
+    private val client = OkHttpClient.Builder().callTimeout(Duration.ofMillis(requestAverageProcessingTime.toMillis() * 3)).build()
 
     private val processingTimes = LinkedList<Long>()
     private val processingTimesMaxSize = rateLimitPerSec*2
@@ -139,7 +139,7 @@ class PaymentExternalSystemAdapterImpl(
     ) {
         if (!isNextAttemptRational(attemptNum, amount)) {
             paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = "Request's next attempt isn't rational.")
+                it.logProcessing(false, now(), transactionId, reason = "Request next attempt is not rational.")
             }
             return
         }

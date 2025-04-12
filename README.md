@@ -1,4 +1,4 @@
-# Test-Case №5 Special
+# Test-Case №6
 
 ## Запуск теста
 ```http request
